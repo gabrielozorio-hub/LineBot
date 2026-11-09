@@ -1,0 +1,456 @@
+<meta charset="utf-8">
+<title>LineBot em 3D</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=Public+Sans:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: estações de um galpão em sequência, separadas por fita de piso; cada estação = palco 3D + ficha técnica */
+:root {
+  --bg: #E8E9E5;
+  --surface: #F4F4F1;
+  --fg: #1C1E20;
+  --muted: #565B5F;
+  --line: #C9CBC4;
+  --tape: #E3B21C;
+  --tape-ink: #1C1E20;
+  --floor: #D3D5CF;
+  --display: 'Archivo', 'Arial Narrow', Arial, sans-serif;
+  --body: 'Public Sans', Arial, sans-serif;
+  --mono: 'JetBrains Mono', 'Courier New', monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #16181A; --surface: #1E2124; --fg: #ECEDE8; --muted: #A2A6A8; --line: #33373B;
+    --tape: #E8B931; --tape-ink: #16181A; --floor: #2B2E31; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #16181A; --surface: #1E2124; --fg: #ECEDE8; --muted: #A2A6A8; --line: #33373B;
+  --tape: #E8B931; --tape-ink: #16181A; --floor: #2B2E31; color-scheme: dark;
+}
+body {
+  background: var(--bg); color: var(--fg);
+  font-family: var(--body); font-size: 17px; line-height: 1.6;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 1180px; margin: 0 auto; }
+a { color: inherit; }
+a:focus-visible, canvas:focus-visible { outline: 2px solid var(--tape); outline-offset: 3px; }
+
+.top { display: flex; justify-content: space-between; align-items: center; gap: 12px 24px; flex-wrap: wrap; padding-block: 18px; border-bottom: 1px solid var(--line); }
+.brand { display: flex; align-items: center; gap: 10px; font-family: var(--display); font-stretch: 75%; font-weight: 800; font-size: 22px; letter-spacing: .02em; text-transform: uppercase; }
+.brand i { width: 18px; height: 18px; background: repeating-linear-gradient(-45deg, var(--tape) 0 5px, var(--fg) 5px 10px); }
+.top nav { display: flex; gap: 6px 18px; flex-wrap: wrap; }
+.top nav a { text-decoration: none; color: var(--muted); font-family: var(--mono); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; }
+.top nav a:hover { color: var(--fg); }
+
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+h1, h2 { font-family: var(--display); font-stretch: 75%; font-weight: 800; text-transform: uppercase; text-wrap: balance; }
+h1 { font-size: clamp(48px, 8vw, 100px); line-height: .92; letter-spacing: -.01em; margin: 14px 0 20px; }
+h1 mark { background: var(--tape); color: var(--tape-ink); padding: 0 .08em; }
+h2 { font-size: clamp(34px, 5vw, 58px); line-height: 1; margin: 10px 0 14px; }
+.lede { font-size: 19px; color: var(--muted); max-width: 50ch; margin: 0; }
+.desc { max-width: 56ch; margin: 0; }
+
+.hero { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 48px; align-items: center; padding-block: 56px 64px; }
+.station { padding-block: 64px; border-top: 8px solid transparent; border-image: repeating-linear-gradient(-45deg, var(--tape) 0 14px, var(--fg) 14px 28px) 8; }
+.station .grid { display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: 48px; align-items: center; }
+.station.flip .stage { order: 2; }
+
+.stage { position: relative; margin: 0; aspect-ratio: 4 / 3; max-width: 100%; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.stage canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: pan-y; }
+.stage canvas:active { cursor: grabbing; }
+.stage .tag, .stage .hint { position: absolute; font-family: var(--mono); font-size: 12px; letter-spacing: .04em; pointer-events: none; }
+.stage .tag { left: 14px; top: 12px; background: var(--tape); color: var(--tape-ink); padding: 2px 8px; font-weight: 600; text-transform: uppercase; }
+.stage .hint { right: 14px; bottom: 10px; color: var(--muted); }
+.stage .fallback { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; text-align: center; color: var(--muted); }
+
+.spec { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 10px 20px; margin: 26px 0 0; padding-top: 18px; border-top: 1px solid var(--line); }
+.spec dt { font-family: var(--mono); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); padding-top: 4px; }
+.spec dd { margin: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+.chips span { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); padding: 3px 10px; border-radius: 999px; color: var(--muted); }
+.chips span:first-child { border-color: transparent; padding-left: 0; }
+
+footer { padding-block: 36px 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 24px; }
+
+@media (max-width: 860px) {
+  .hero, .station .grid { grid-template-columns: minmax(0, 1fr); gap: 28px; }
+  .station.flip .stage { order: 0; }
+  .hero { padding-block: 36px 48px; }
+  .station { padding-block: 48px; }
+}
+@media (max-width: 480px) {
+  .spec { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  .spec dd { margin-bottom: 10px; }
+}
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div class="brand"><i aria-hidden="true"></i>LineBot</div>
+    <nav aria-label="Estações">
+      <a href="#prototipo">Protótipo</a>
+      <a href="#paleteira">Paleteira</a>
+      <a href="#tablet">Robô com tablet</a>
+      <a href="#inventario">Inventário</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero" id="prototipo">
+      <div>
+        <p class="eyebrow">TDE · Conectividade de Sistemas Ciberfísicos</p>
+        <h1>Do protótipo <mark>ao galpão</mark></h1>
+        <p class="lede">O LineBot segue uma linha no chão, recebe comandos pelo celular e mostra tudo num painel web. Aqui está ele em 3D, e três robôs que a mesma ideia poderia virar numa empresa.</p>
+        <dl class="spec">
+          <dt>Cérebro</dt><dd>ESP32 DevKit V1</dd>
+          <dt>Guiagem</dt><dd>Barra de 8 sensores infravermelhos</dd>
+          <dt>Tração</dt><dd>4 motores DC pela ponte H L298N</dd>
+          <dt>Controle</dt><dd>Celular ou PC, pela rede Wi-Fi do próprio robô</dd>
+          <dt>Custo</dt><dd>≈ R$ 300 em peças</dd>
+        </dl>
+      </div>
+      <figure class="stage" data-model="carro">
+        <canvas tabindex="0" role="img" aria-label="Modelo 3D do LineBot: chassi de acrílico em dois andares, quatro rodas amarelas, ESP32, ponte H, pilhas e barra de sensores na frente, sobre uma linha preta"></canvas>
+        <span class="tag">Estação 01 · protótipo</span>
+        <span class="hint">arraste para girar</span>
+      </figure>
+    </section>
+
+    <section class="station" id="paleteira">
+      <div class="grid">
+        <figure class="stage" data-model="paleteira">
+          <canvas tabindex="0" role="img" aria-label="Modelo 3D de uma paleteira automática levando um pallet com oito caixas, com sensor lidar no topo, faixa de aviso e botão de emergência"></canvas>
+          <span class="tag">Estação 02 · conceito</span>
+          <span class="hint">arraste para girar</span>
+        </figure>
+        <div>
+          <p class="eyebrow">Escala 1 · Logística</p>
+          <h2>Paleteira automática</h2>
+          <p class="desc">Segue a fita no piso do estoque até a expedição levando o pallet sozinha. O operador chama a entrega pelo painel e acompanha cada etapa ao vivo.</p>
+          <dl class="spec">
+            <dt>Missão</dt><dd>Levar pallets entre estoque e expedição</dd>
+            <dt>Guiagem</dt><dd>Linha ou fita magnética no piso, como no LineBot</dd>
+            <dt>Segurança</dt><dd>Lidar no topo, faixa de aviso e botão de emergência</dd>
+            <dt>Painel</dt><dd>O mesmo dashboard, com uma fila de entregas</dd>
+          </dl>
+          <div class="chips"><span>Herda:</span><span>seguidor de linha</span><span>painel web</span><span>logs por sessão</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="station flip" id="tablet">
+      <div class="grid">
+        <figure class="stage" data-model="tablet">
+          <canvas tabindex="0" role="img" aria-label="Modelo 3D de um robô redondo com uma coluna e um tablet no topo mostrando pedidos da doca 3, com anel de luz na base"></canvas>
+          <span class="tag">Estação 03 · conceito</span>
+          <span class="hint">arraste para girar</span>
+        </figure>
+        <div>
+          <p class="eyebrow">Escala 2 · Atendimento</p>
+          <h2>Robô com tablet</h2>
+          <p class="desc">Circula pelos corredores do galpão mostrando o pedido que está sendo separado, avisa sobre as docas e pode guiar um visitante até o setor certo.</p>
+          <dl class="spec">
+            <dt>Missão</dt><dd>Informar e guiar dentro do galpão</dd>
+            <dt>Tela</dt><dd>Tablet no topo, com a interface do painel</dd>
+            <dt>Guiagem</dt><dd>Linha no piso e marcadores em cada doca</dd>
+            <dt>Aviso</dt><dd>Anel de luz na base mostra o estado do robô</dd>
+          </dl>
+          <div class="chips"><span>Herda:</span><span>painel web</span><span>controle remoto</span><span>parada de segurança</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="station" id="inventario">
+      <div class="grid">
+        <figure class="stage" data-model="inventario">
+          <canvas tabindex="0" role="img" aria-label="Modelo 3D de um robô de inventário com uma torre de quatro leitores em alturas diferentes, cada um projetando um feixe de leitura"></canvas>
+          <span class="tag">Estação 04 · conceito</span>
+          <span class="hint">arraste para girar</span>
+        </figure>
+        <div>
+          <p class="eyebrow">Escala 3 · Estoque</p>
+          <h2>Robô de inventário</h2>
+          <p class="desc">Uma torre com leitores em quatro alturas. Ele percorre os corredores, lê as etiquetas das prateleiras e registra a contagem, do mesmo jeito que o LineBot registra cada evento nos logs.</p>
+          <dl class="spec">
+            <dt>Missão</dt><dd>Contar o estoque das prateleiras</dd>
+            <dt>Sensores</dt><dd>4 leitores na torre, um por nível de prateleira</dd>
+            <dt>Rotina</dt><dd>Rondas fora do horário de pico</dd>
+            <dt>Saída</dt><dd>Um relatório por ronda, como as sessões de log</dd>
+          </dl>
+          <div class="chips"><span>Herda:</span><span>seguidor de linha</span><span>logs na flash</span><span>Wi-Fi próprio</span></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>Modelos 3D ilustrativos, montados em código a partir do protótipo real.</span>
+    <span>LineBot · 2026</span>
+  </footer>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function () {
+  const stagesEl = document.querySelectorAll('.stage');
+  if (!window.THREE) {
+    stagesEl.forEach((el) => {
+      const d = document.createElement('div');
+      d.className = 'fallback';
+      d.textContent = 'Não foi possível carregar o 3D nesta conexão.';
+      el.appendChild(d);
+    });
+    return;
+  }
+  const T = THREE;
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const YELLOW = 0xE8B931;
+
+  // ---------- ajudantes
+  const M = (color, o) => new T.MeshStandardMaterial(Object.assign({ color, roughness: 0.55, metalness: 0.05 }, o || {}));
+  const glow = (color, k) => M(color, { emissive: color, emissiveIntensity: k || 1 });
+  const B = (w, h, d) => new T.BoxGeometry(w, h, d);
+  const C = (r, h, seg, rTop) => new T.CylinderGeometry(rTop == null ? r : rTop, r, h, seg || 24);
+  function add(parent, geo, mat, x, y, z) {
+    const m = new T.Mesh(geo, mat);
+    m.position.set(x || 0, y || 0, z || 0);
+    parent.add(m);
+    return m;
+  }
+  function canvasTex(w, h, draw) {
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    draw(c.getContext('2d'), w, h);
+    return new T.CanvasTexture(c);
+  }
+  const stripeTex = (rep) => {
+    const t = canvasTex(128, 32, (g) => {
+      g.fillStyle = '#1C1E20'; g.fillRect(0, 0, 128, 32);
+      g.fillStyle = '#E3B21C';
+      for (let i = -32; i < 160; i += 32) {
+        g.beginPath(); g.moveTo(i, 32); g.lineTo(i + 16, 32); g.lineTo(i + 32, 0); g.lineTo(i + 16, 0); g.closePath(); g.fill();
+      }
+    });
+    t.wrapS = T.RepeatWrapping; t.repeat.set(rep, 1);
+    return t;
+  };
+  const shadowTex = canvasTex(128, 128, (g) => {
+    const r = g.createRadialGradient(64, 64, 4, 64, 64, 64);
+    r.addColorStop(0, 'rgba(0,0,0,0.38)'); r.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = r; g.fillRect(0, 0, 128, 128);
+  });
+
+  // ---------- modelos
+  function carro(g) {
+    const acrilico = M(0xdce8ee, { transparent: true, opacity: 0.45, roughness: 0.15 });
+    const amarelo = M(YELLOW), pneu = M(0x26282a, { roughness: 0.9 }), metal = M(0xcfcfcf, { metalness: 0.7, roughness: 0.3 });
+    add(g, B(2.8, 0.05, 1.5), acrilico, 0, 0.55, 0);
+    add(g, B(2.4, 0.05, 1.4), acrilico, -0.1, 1.05, 0);
+    const latao = M(0xc9a64a, { metalness: 0.6, roughness: 0.35 });
+    [-0.95, 0.85].forEach((x) => [-0.55, 0.55].forEach((z) => add(g, C(0.03, 0.5, 8), latao, x, 0.8, z)));
+    [-0.85, 0.85].forEach((x) => [-1, 1].forEach((s) => {
+      add(g, B(0.55, 0.28, 0.3), amarelo, x, 0.38, s * 0.5);
+      add(g, C(0.04, 0.2, 8), metal, x, 0.42, s * 0.72).rotation.x = Math.PI / 2;
+      add(g, C(0.42, 0.26, 32), pneu, x, 0.42, s * 0.92).rotation.x = Math.PI / 2;
+      add(g, C(0.3, 0.3, 24), amarelo, x, 0.42, s * 0.92).rotation.x = Math.PI / 2;
+    }));
+    // pilhas no andar de cima
+    add(g, B(1.0, 0.16, 0.62), M(0x222426), -0.45, 1.155, 0);
+    for (let i = 0; i < 4; i++) add(g, C(0.07, 0.88, 16), M(0x2f5d9e, { metalness: 0.3 }), -0.45, 1.25, -0.21 + i * 0.14).rotation.z = Math.PI / 2;
+    // ESP32, protoboard e botao
+    add(g, B(0.8, 0.03, 0.38), M(0x1d2733), 0.55, 1.09, -0.3);
+    add(g, B(0.32, 0.06, 0.26), M(0xb8bcc0, { metalness: 0.8, roughness: 0.3 }), 0.45, 1.13, -0.3);
+    add(g, B(0.04, 0.03, 0.04), glow(0x3b82f6, 1.5), 0.85, 1.115, -0.4);
+    add(g, B(0.55, 0.1, 0.36), M(0xf1f0ec), 0.55, 1.125, 0.28);
+    add(g, B(0.16, 0.1, 0.1), M(0x222426), -1.15, 1.125, 0.45);
+    add(g, B(0.04, 0.08, 0.04), M(0xc0392b), -1.15, 1.2, 0.45);
+    // ponte H entre os andares
+    add(g, B(0.6, 0.03, 0.6), M(0xb3312c), 0.35, 0.59, 0.1);
+    for (let i = 0; i < 5; i++) add(g, B(0.035, 0.24, 0.34), M(0x1b1b1b, { metalness: 0.4 }), 0.2 + i * 0.07, 0.725, 0.1);
+    // barra de sensores na frente
+    add(g, B(0.04, 0.38, 0.3), acrilico, 1.42, 0.35, 0);
+    add(g, B(0.16, 0.03, 1.3), M(0x22344d), 1.5, 0.16, 0);
+    for (let i = 0; i < 8; i++) add(g, B(0.06, 0.04, 0.06), M(0x111111), 1.5, 0.125, -0.56 + i * 0.16);
+    // fios
+    const fio = (pts, cor) => add(g, new T.TubeGeometry(new T.CatmullRomCurve3(pts.map((p) => new T.Vector3(p[0], p[1], p[2]))), 40, 0.018, 6, false), M(cor));
+    fio([[0.3, 1.11, -0.2], [0.1, 1.3, -0.05], [0.0, 0.9, 0.15], [0.25, 0.62, 0.3]], 0xd35400);
+    fio([[0.35, 1.11, -0.15], [0.2, 1.35, 0.0], [0.1, 0.95, 0.25], [0.3, 0.62, 0.35]], 0x27ae60);
+    fio([[0.8, 1.11, -0.15], [1.1, 1.0, -0.2], [1.35, 0.6, -0.3], [1.5, 0.19, -0.4]], 0x8e44ad);
+    fio([[0.8, 1.11, -0.1], [1.15, 0.95, 0.0], [1.38, 0.55, 0.1], [1.5, 0.19, 0.2]], 0xc0392b);
+    // a linha preta no chao
+    add(g, new T.PlaneGeometry(5.2, 0.22), M(0x1d1f21, { roughness: 0.8 }), 0, 0.004, 0).rotation.x = -Math.PI / 2;
+  }
+
+  function paleteira(g) {
+    const cinza = M(0xd4d5d0), escuro = M(0x45484c);
+    add(g, B(1.0, 2.0, 1.4), cinza, -1.2, 1.1, 0);
+    add(g, B(1.04, 0.08, 1.44), escuro, -1.2, 2.12, 0);
+    add(g, B(1.02, 0.22, 1.42), new T.MeshStandardMaterial({ map: stripeTex(4), roughness: 0.6 }), -1.2, 0.32, 0);
+    add(g, B(0.03, 0.07, 1.1), glow(YELLOW, 0.9), -0.69, 1.85, 0);
+    add(g, C(0.2, 0.18, 32), escuro, -1.2, 2.25, 0);
+    add(g, C(0.16, 0.08, 32), M(0x1b1b1b), -1.2, 2.38, 0);
+    add(g, C(0.12, 0.06, 24), M(YELLOW), -1.5, 2.19, 0.48);
+    add(g, C(0.08, 0.08, 24), M(0xc0392b), -1.5, 2.25, 0.48);
+    add(g, B(0.03, 0.35, 0.5), M(0x1b1b1b), -1.715, 1.6, 0);
+    [-0.55, 0.55].forEach((z) => { add(g, C(0.16, 0.12, 20), M(0x26282a), -1.4, 0.16, z).rotation.x = Math.PI / 2; });
+    // garfo que sobe e desce com o pallet
+    const garfo = new T.Group(); g.add(garfo);
+    add(garfo, B(0.1, 1.1, 1.2), escuro, -0.65, 0.65, 0);
+    [-0.38, 0.38].forEach((z) => add(garfo, B(2.4, 0.08, 0.28), escuro, 0.55, 0.18, z));
+    const pallet = new T.Group(); pallet.position.set(0.6, 0.055, 0); garfo.add(pallet);
+    const madeira = M(0xA57C4F, { roughness: 0.85 });
+    for (let i = 0; i < 6; i++) add(pallet, B(0.24, 0.05, 1.4), madeira, -0.75 + i * 0.3, 0.19, 0);
+    [-0.62, 0, 0.62].forEach((z) => add(pallet, B(1.8, 0.14, 0.14), madeira, 0, 0.07, z));
+    const papelao = M(0xB98C5B, { roughness: 0.9 }), fita = M(0xd9c4a0);
+    [-0.42, 0.42].forEach((x) => [-0.33, 0.33].forEach((z) => [0, 1].forEach((n) => {
+      const y = 0.495 + n * 0.56;
+      add(pallet, B(0.8, 0.55, 0.63), papelao, x, y, z);
+      if (n === 1) add(pallet, B(0.81, 0.02, 0.12), fita, x, y + 0.28, z);
+    })));
+    return (t) => { garfo.position.y = 0.14 * (0.5 - 0.5 * Math.cos(t * 0.7)); };
+  }
+
+  function tablet(g) {
+    const cinza = M(0xe2e3df), escuro = M(0x3d4044);
+    add(g, C(0.75, 0.42, 48), cinza, 0, 0.29, 0);
+    add(g, new T.TorusGeometry(0.76, 0.06, 12, 48), escuro, 0, 0.14, 0).rotation.x = Math.PI / 2;
+    add(g, C(0.72, 0.06, 48, 0.6), cinza, 0, 0.53, 0);
+    const anel = add(g, new T.TorusGeometry(0.58, 0.025, 8, 64), glow(YELLOW, 1), 0, 0.565, 0);
+    anel.rotation.x = Math.PI / 2;
+    add(g, C(0.16, 0.12, 24), cinza, 0, 0.62, 0);
+    add(g, C(0.1, 1.5, 24), escuro, 0, 1.4, 0);
+    add(g, B(0.18, 0.25, 0.18), escuro, 0, 2.1, -0.05);
+    const cabeca = new T.Group(); cabeca.position.set(0, 2.3, 0.02); cabeca.rotation.x = -0.35; g.add(cabeca);
+    add(cabeca, B(1.15, 0.75, 0.07), M(0x1f2124), 0, 0, 0);
+    const tela = canvasTex(512, 320, (c, w, h) => {
+      c.fillStyle = '#1C1E20'; c.fillRect(0, 0, w, h);
+      c.fillStyle = '#E3B21C'; c.fillRect(0, 0, w, 60);
+      c.fillStyle = '#1C1E20'; c.font = 'bold 28px Arial'; c.fillText('LineBot · Doca 3', 22, 40);
+      c.fillStyle = '#ECEDE8'; c.font = 'bold 30px Arial'; c.fillText('Pedido #482', 22, 118);
+      c.fillStyle = '#A2A6A8'; c.font = '22px Arial'; c.fillText('12 caixas · indo para a expedição', 22, 152);
+      c.fillStyle = '#33373B'; c.fillRect(22, 182, 468, 16);
+      c.fillStyle = '#E3B21C'; c.fillRect(22, 182, 300, 16);
+      c.fillStyle = '#ECEDE8'; c.font = 'bold 24px Arial'; c.fillText('Próximo: Pedido #483', 22, 250);
+      c.fillStyle = '#A2A6A8'; c.font = '22px Arial'; c.fillText('4 caixas · corredor B', 22, 284);
+    });
+    add(cabeca, new T.PlaneGeometry(1.05, 0.65), new T.MeshBasicMaterial({ map: tela }), 0, 0, 0.037);
+    add(cabeca, B(0.04, 0.04, 0.02), M(0x0e0f10), 0, 0.345, 0.04);
+    return (t) => { anel.material.emissiveIntensity = 0.6 + 0.5 * (0.5 + 0.5 * Math.sin(t * 2.2)); };
+  }
+
+  function inventario(g) {
+    const cinza = M(0xd9dad5), escuro = M(0x3d4044);
+    add(g, B(1.5, 0.45, 1.05), cinza, 0, 0.36, 0);
+    add(g, B(1.52, 0.1, 1.07), new T.MeshStandardMaterial({ map: stripeTex(6), roughness: 0.6 }), 0, 0.2, 0);
+    [-0.5, 0.5].forEach((x) => [-0.55, 0.55].forEach((z) => { add(g, C(0.14, 0.1, 20), M(0x26282a), x, 0.14, z).rotation.x = Math.PI / 2; }));
+    add(g, B(0.4, 0.02, 0.3), M(0x1b1b1b), 0.35, 0.59, 0);
+    add(g, B(0.14, 2.6, 0.14), escuro, -0.45, 1.88, 0);
+    add(g, C(0.07, 0.12, 16), glow(YELLOW, 1), -0.45, 3.24, 0);
+    const feixes = [];
+    const leque = new T.Shape(); leque.moveTo(0, 0); leque.lineTo(1.6, 0.3); leque.lineTo(1.6, -0.3); leque.closePath();
+    for (let i = 0; i < 4; i++) {
+      const y = 0.95 + i * 0.6;
+      add(g, B(0.22, 0.16, 0.34), escuro, -0.3, y, 0);
+      add(g, B(0.02, 0.08, 0.26), glow(YELLOW, 0.9), -0.185, y, 0);
+      const f = add(g, new T.ShapeGeometry(leque), new T.MeshBasicMaterial({ color: YELLOW, transparent: true, opacity: 0.18, side: T.DoubleSide, depthWrite: false }), -0.18, y, 0);
+      f.rotation.x = -Math.PI / 2;
+      feixes.push(f);
+    }
+    return (t) => feixes.forEach((f, i) => { f.material.opacity = 0.04 + 0.26 * Math.max(0, Math.sin(t * 2 - i * 0.8)); });
+  }
+
+  const MODELOS = {
+    carro: { build: carro, cam: [0, 2.7, 6.3], alvo: [0, 0.55, 0], chao: 2.6, giro: -0.6 },
+    paleteira: { build: paleteira, cam: [0, 3.3, 8.4], alvo: [0, 1.0, 0], chao: 3.0, giro: -0.7 },
+    tablet: { build: tablet, cam: [0, 2.5, 5.1], alvo: [0, 1.3, 0], chao: 1.6, giro: 0.5 },
+    inventario: { build: inventario, cam: [0, 3.6, 8.6], alvo: [0, 1.55, 0], chao: 2.4, giro: -0.5 },
+  };
+
+  // ---------- palcos
+  const corChao = () => new T.Color(getComputedStyle(document.documentElement).getPropertyValue('--floor').trim() || '#D3D5CF');
+  const palcos = [];
+  stagesEl.forEach((el) => {
+    const cfg = MODELOS[el.dataset.model];
+    const canvas = el.querySelector('canvas');
+    let renderer;
+    try { renderer = new T.WebGLRenderer({ canvas, antialias: true, alpha: true }); }
+    catch (e) {
+      const d = document.createElement('div'); d.className = 'fallback'; d.textContent = 'Este navegador não conseguiu abrir o 3D.'; el.appendChild(d);
+      return;
+    }
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    const scene = new T.Scene();
+    const camera = new T.PerspectiveCamera(32, 4 / 3, 0.1, 100);
+    camera.position.set(...cfg.cam);
+    camera.lookAt(...cfg.alvo);
+    scene.add(new T.HemisphereLight(0xffffff, 0x77776f, 0.85));
+    const sol = new T.DirectionalLight(0xffffff, 0.75); sol.position.set(3, 6, 4); scene.add(sol);
+    const contra = new T.DirectionalLight(0xffffff, 0.3); contra.position.set(-4, 3, -3); scene.add(contra);
+
+    const chaoMat = new T.MeshStandardMaterial({ color: corChao(), roughness: 1 });
+    add(scene, new T.CircleGeometry(cfg.chao, 64), chaoMat, 0, 0, 0).rotation.x = -Math.PI / 2;
+    add(scene, new T.RingGeometry(cfg.chao - 0.05, cfg.chao, 64), new T.MeshBasicMaterial({ color: YELLOW }), 0, 0.002, 0).rotation.x = -Math.PI / 2;
+    const sombra = add(scene, new T.PlaneGeometry(cfg.chao * 1.5, cfg.chao * 1.5), new T.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false }), 0, 0.003, 0);
+    sombra.rotation.x = -Math.PI / 2;
+
+    const eixo = new T.Group(); eixo.rotation.y = cfg.giro; scene.add(eixo);
+    const anima = cfg.build(eixo);
+    const p = { el, renderer, scene, camera, eixo, anima, chaoMat, visivel: false, arrastando: false };
+    palcos.push(p);
+
+    const ajusta = () => {
+      const w = el.clientWidth, h = el.clientHeight;
+      if (!w || !h) return;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h; camera.updateProjectionMatrix();
+      renderer.render(scene, camera);
+    };
+    new ResizeObserver(ajusta).observe(el);
+    ajusta();
+
+    let ultimoX = 0;
+    canvas.addEventListener('pointerdown', (e) => { p.arrastando = true; ultimoX = e.clientX; canvas.setPointerCapture(e.pointerId); });
+    canvas.addEventListener('pointermove', (e) => {
+      if (!p.arrastando) return;
+      eixo.rotation.y += (e.clientX - ultimoX) * 0.012; ultimoX = e.clientX;
+      if (reduce) renderer.render(scene, camera);
+    });
+    const solta = () => { p.arrastando = false; };
+    canvas.addEventListener('pointerup', solta);
+    canvas.addEventListener('pointercancel', solta);
+    canvas.addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      e.preventDefault();
+      eixo.rotation.y += e.key === 'ArrowLeft' ? -0.2 : 0.2;
+      renderer.render(scene, camera);
+    });
+  });
+
+  const vigia = new IntersectionObserver((itens) => itens.forEach((it) => {
+    const p = palcos.find((q) => q.el === it.target);
+    if (p) p.visivel = it.isIntersecting;
+  }), { rootMargin: '100px' });
+  palcos.forEach((p) => vigia.observe(p.el));
+
+  const trocaTema = () => palcos.forEach((p) => { p.chaoMat.color = corChao(); p.renderer.render(p.scene, p.camera); });
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', trocaTema);
+  new MutationObserver(trocaTema).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+  let antes = performance.now();
+  function quadro(agora) {
+    const dt = Math.min(0.05, (agora - antes) / 1000); antes = agora;
+    const t = agora / 1000;
+    palcos.forEach((p) => {
+      if (!p.visivel || reduce) return;
+      if (!p.arrastando) p.eixo.rotation.y += dt * 0.45;
+      if (p.anima) p.anima(t);
+      p.renderer.render(p.scene, p.camera);
+    });
+    requestAnimationFrame(quadro);
+  }
+  requestAnimationFrame(quadro);
+})();
+</script>

@@ -1,0 +1,682 @@
+// =====================================================================
+//  Carrinho seguidor de linha - ESP32 + L298N + barra de 8 sensores (QTR-8RC)
+//  Rede Wi-Fi propria: "ESP32" / senha "esp12345"  ->  abra http://192.168.4.1
+// =====================================================================
+#include <WiFi.h>
+#include <WebServer.h>
+#include <LittleFS.h>
+#include <Preferences.h>
+#include "pagina.h"
+
+// ---------------- Wi-Fi ----------------
+const char* WIFI_NOME  = "ESP32";
+const char* WIFI_SENHA = "esp12345";   // precisa ter no minimo 8 caracteres
+
+// ---------------- Pinos ----------------
+const int ENA = 18, IN1 = 16, IN2 = 17;                     // motor direito  (L298N lado A)
+const int ENB = 22, IN3 = 19, IN4 = 21;                     // motor esquerdo (L298N lado B)
+const int SENSORES[8] = {32, 33, 25, 26, 27, 14, 13, 4};    // D1 (esquerda) ... D8 (direita)
+const int PINO_IR = 23;                                     // furo IR da barra: liga os LEDs infravermelhos
+const int PINO_BATERIA = 34;                                // meio do divisor de tensao
+const int PINO_LED = 2;                                     // LED azul da placa
+
+// ---------------- Ajustes do seu carrinho ----------------
+const bool INVERTE_ESQ = false;        // motor girando ao contrario? troque para true
+const bool INVERTE_DIR = false;
+const bool LINHA_PRETA = true;         // linha preta no chao branco
+const float DIVISOR_BAT = 4.0;         // 4 resistores iguais de 100k: 3 do lado da bateria, 1 do lado do GND
+const float BAT_VAZIA = 4.4;           // 4 pilhas AA: 4,4 V vazia
+const float BAT_CHEIA = 6.4;           //              6,4 V cheia
+const uint16_t TIMEOUT_RC = 2500;      // us - tempo maximo de leitura de cada sensor
+const int BRANCO_MAX = 600;            // leitura ate aqui = branco (o branco oscila entre 0 e ~600)
+const int LIMIAR_PRETO = 1500;         // leitura acima disso = sensor no preto (o preto da 2500)
+const unsigned long PARADA_SEGURANCA = 1000;  // ms sem comando no manual = para (o Wi-Fi as vezes atrasa)
+const unsigned long CONFIRMA_LINHA = 100;     // ms vendo a linha antes de comecar a andar (evita falso disparo)
+const int VEL_BUSCA = 120;                    // forca para girar procurando a linha (baixo demais = motor nao gira)
+const unsigned long BUSCA_LADO = 700;         // ms girando para o primeiro lado (o segundo lado usa o dobro)
+const unsigned long PAUSA_BUSCA = 150;        // ms parado entre um movimento e outro, para ir com calma
+const unsigned long TODOS_PRETO_MAX = 500;    // ms com os 8 no preto = carrinho levantado ou fora da pista
+
+// ---------------- Estado ----------------
+enum Modo { PARADO, AUTO, MANUAL, CALIBRANDO };
+const char* NOMES_MODO[] = {"Parado", "Automático", "Manual", "Calibrando"};
+Modo modo = PARADO;
+
+WebServer server(80);
+Preferences prefs;
+
+struct Config { int vb; float kp; float kd; int vm; } cfg = {130, 0.05, 0.5, 180};
+unsigned long salvarCfgEm = 0;
+
+uint16_t bruto[8], minimo[8], maximo[8];
+int filtrado[8];             // leitura bruta suavizada (media movel)
+int valor[8];                // 0 = chao, 1000 = linha
+int posicao = 3500;          // 0 (D1) ... 7000 (D8)
+bool linhaVisivel = false;
+int pretos = 0;              // quantos sensores veem preto (faixa de chegada = quase todos)
+int ultimoErro = 0;
+bool andando = false;
+
+unsigned long ultimoCmd = 0, calibInicio = 0, vistaDesde = 0, todosDesde = 0;
+unsigned long testeAte = 0;    // teste de motores pelo painel (para sozinho depois de 2 s)
+
+// etapas do modo automatico
+enum Etapa { AGUARDANDO, SEGUINDO, PAUSA_1, BUSCA_1, PAUSA_2, BUSCA_2 };
+Etapa etapa = AGUARDANDO;
+unsigned long etapaDesde = 0;
+int ladoBusca = 1;             // -1 = procura primeiro na esquerda, 1 = na direita
+
+// voltas
+unsigned long voltaInicio = 0, ultimaVolta = 0, recorde = 0, marcaDesde = 0, ultimaMarca = 0;
+unsigned long voltasSessao = 0;
+
+// odometro vitalicio (salvo na flash) - so conta quando esta na bateria, nao no cabo USB
+unsigned long sessao = 0, baseLigado = 0, baseAndando = 0, totalVoltas = 0;
+unsigned long ligadoMs = 0, andandoMs = 0, vezesLigado = 0;
+bool contouLigado = false;
+
+const float BAT_PRESENTE = 3.0;        // abaixo disso = sem bateria (so USB)
+float bateriaV = -1;
+int bateriaPct = 0;
+bool naBateria = false;
+bool avisouBateria = false, logouBateria = false;
+int clientes = 0;
+
+// =====================================================================
+//  Logs na memoria flash (LittleFS)
+//  Cada linha: sessao|millis|categoria|mensagem
+//  Categorias: SIS (sistema) COR (corrida) PID BAT (bateria) CON (conexao)
+// =====================================================================
+const char* LOG_ATUAL = "/log.txt";
+const char* LOG_ANTIGO = "/log_old.txt";
+const size_t LOG_MAX = 40000;          // ao passar disso o arquivo vira o "antigo"
+
+void logar(const char* cat, const String& msg) {
+  Serial.printf("[%s] %s\n", cat, msg.c_str());
+  if (LittleFS.exists(LOG_ATUAL)) {
+    File f = LittleFS.open(LOG_ATUAL, "r");
+    size_t tam = f.size();
+    f.close();
+    if (tam > LOG_MAX) {
+      LittleFS.remove(LOG_ANTIGO);
+      LittleFS.rename(LOG_ATUAL, LOG_ANTIGO);
+    }
+  }
+  File f = LittleFS.open(LOG_ATUAL, "a");
+  if (!f) return;
+  f.printf("%lu|%lu|%s|%s\n", sessao, millis(), cat, msg.c_str());
+  f.close();
+}
+
+String segundos(unsigned long ms) {
+  return String(ms / 1000.0, 1) + " s";
+}
+
+const char* motivoReset() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "ligado pelo botão";
+    case ESP_RST_SW:       return "reinício por software";
+    case ESP_RST_PANIC:    return "travamento do programa";
+    case ESP_RST_BROWNOUT: return "queda de tensão (bateria fraca?)";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:      return "watchdog";
+    case ESP_RST_EXT:      return "botão reset";
+    default:               return "desconhecido";
+  }
+}
+
+// =====================================================================
+//  Motores
+// =====================================================================
+void motor(int en, int a, int b, int vel, bool inverte) {
+  if (inverte) vel = -vel;
+  vel = constrain(vel, -255, 255);
+  digitalWrite(a, vel > 0);
+  digitalWrite(b, vel < 0);
+  ledcWrite(en, abs(vel));
+}
+
+void motores(int esq, int dir) {
+  motor(ENB, IN3, IN4, esq, INVERTE_ESQ);
+  motor(ENA, IN1, IN2, dir, INVERTE_DIR);
+  andando = esq != 0 || dir != 0;
+}
+
+// =====================================================================
+//  Sensores (barra RC: carrega o capacitor e mede o tempo de descarga)
+// =====================================================================
+void lerSensores() {
+  for (int i = 0; i < 8; i++) {
+    pinMode(SENSORES[i], OUTPUT);
+    digitalWrite(SENSORES[i], HIGH);
+  }
+  delayMicroseconds(10);
+  for (int i = 0; i < 8; i++) {
+    bruto[i] = TIMEOUT_RC;
+    pinMode(SENSORES[i], INPUT);
+  }
+  uint32_t inicio = micros(), dt;
+  uint8_t pendentes = 0xFF;
+  while (pendentes && (dt = micros() - inicio) < TIMEOUT_RC) {
+    for (int i = 0; i < 8; i++) {
+      if ((pendentes & (1 << i)) && digitalRead(SENSORES[i]) == LOW) {
+        bruto[i] = dt;
+        pendentes &= ~(1 << i);
+      }
+    }
+  }
+
+  long soma = 0, peso = 0;
+  pretos = 0;
+  for (int i = 0; i < 8; i++) {
+    // media movel: suaviza a oscilacao do branco (cada leitura nova vale 1/3)
+    filtrado[i] = (filtrado[i] * 2 + bruto[i]) / 3;
+    int leitura = LINHA_PRETA ? filtrado[i] : TIMEOUT_RC - filtrado[i];
+    // faixa fixa: ate BRANCO_MAX = 0 (chao), TIMEOUT_RC = 1000 (linha)
+    int v = constrain((long)(leitura - BRANCO_MAX) * 1000 / (TIMEOUT_RC - BRANCO_MAX), 0, 1000);
+    valor[i] = v;
+    if (v > 0) { soma += (long)v * i * 1000; peso += v; }
+    if (leitura > LIMIAR_PRETO) pretos++;
+  }
+  // linha = de 1 a 5 sensores no preto. Os 8 no preto = faixa de chegada, carrinho levantado
+  // ou fora da pista (sem nada embaixo o sensor tambem le 2500)
+  linhaVisivel = pretos >= 1 && pretos <= 5;
+  if (linhaVisivel) posicao = soma / peso;    // senao guarda a ultima posicao (lado onde viu a linha)
+}
+
+void carregarCalibracao() {
+  for (int i = 0; i < 8; i++) { minimo[i] = 150; maximo[i] = TIMEOUT_RC; }
+  if (prefs.getBytesLength("cmin") == sizeof(minimo)) {
+    prefs.getBytes("cmin", minimo, sizeof(minimo));
+    prefs.getBytes("cmax", maximo, sizeof(maximo));
+  }
+}
+
+// =====================================================================
+//  Modos
+// =====================================================================
+void setModo(Modo m) {
+  if (m == modo) return;
+  motores(0, 0);
+  modo = m;
+  testeAte = 0;
+  voltaInicio = 0;
+  vistaDesde = 0;
+  todosDesde = 0;
+  etapa = AGUARDANDO;
+  ultimoErro = 0;
+  if (m == CALIBRANDO) {
+    calibInicio = millis();
+    for (int i = 0; i < 8; i++) { minimo[i] = TIMEOUT_RC; maximo[i] = 0; }
+  }
+  logar("SIS", String("Modo: ") + NOMES_MODO[m]);
+}
+
+void calibrar(unsigned long agora) {
+  for (int i = 0; i < 8; i++) {
+    if (bruto[i] < minimo[i]) minimo[i] = bruto[i];
+    if (bruto[i] > maximo[i]) maximo[i] = bruto[i];
+  }
+  unsigned long t = agora - calibInicio;
+  if (t < 4000) {
+    // gira para um lado e para o outro passando os sensores sobre a linha
+    int fase = t / 1000;
+    int v = (fase == 0 || fase == 3) ? 120 : -120;
+    motores(-v, v);
+    return;
+  }
+  motores(0, 0);
+  prefs.putBytes("cmin", minimo, sizeof(minimo));
+  prefs.putBytes("cmax", maximo, sizeof(maximo));
+  String ruins = "";
+  for (int i = 0; i < 8; i++)
+    if (maximo[i] - minimo[i] < 300) ruins += " D" + String(i + 1);
+  if (ruins.length()) logar("SIS", "Calibração fraca nos sensores" + ruins);
+  else logar("SIS", "Calibração concluída");
+  setModo(PARADO);
+}
+
+void contarVolta(unsigned long agora) {
+  if (!voltaInicio) {
+    voltaInicio = agora;
+    logar("COR", "Largada");
+    return;
+  }
+  unsigned long t = agora - voltaInicio;
+  voltaInicio = agora;
+  ultimaVolta = t;
+  voltasSessao++;
+  totalVoltas++;
+  prefs.putULong("tv", totalVoltas);
+  String msg = "Volta " + String(voltasSessao) + ": " + segundos(t);
+  if (!recorde || t < recorde) {
+    recorde = t;
+    prefs.putULong("rec", recorde);
+    msg += " ★ recorde";
+  }
+  logar("COR", msg);
+}
+
+void mudarEtapa(Etapa e, unsigned long agora) {
+  etapa = e;
+  etapaDesde = agora;
+}
+
+void aguardar(unsigned long agora, const String& motivo) {
+  motores(0, 0);
+  voltaInicio = 0;
+  vistaDesde = 0;
+  mudarEtapa(AGUARDANDO, agora);
+  logar("COR", motivo);
+}
+
+// gira no lugar: lado 1 = direita, -1 = esquerda
+void girar(int lado) {
+  motores(lado * VEL_BUSCA, -lado * VEL_BUSCA);
+}
+
+void seguirLinha(unsigned long agora) {
+  // faixa de chegada: quase todos os sensores no preto por 30 ms enquanto segue
+  if (etapa == SEGUINDO && pretos >= 6) {
+    if (!marcaDesde) marcaDesde = agora;
+    else if (agora - marcaDesde >= 30 && agora - ultimaMarca > 2000) {
+      ultimaMarca = agora;
+      contarVolta(agora);
+    }
+  } else {
+    marcaDesde = 0;
+  }
+
+  // os 8 no preto por muito tempo nao e linha: carrinho levantado ou fora da pista
+  if (pretos >= 6) {
+    if (!todosDesde) todosDesde = agora;
+    if (agora - todosDesde > TODOS_PRETO_MAX && etapa != AGUARDANDO) {
+      aguardar(agora, "Todos os sensores no preto (levantado ou fora da pista): parado");
+      return;
+    }
+  } else {
+    todosDesde = 0;
+  }
+
+  unsigned long t = agora - etapaDesde;
+  switch (etapa) {
+    case AGUARDANDO:
+      // parado: so comeca a andar depois de ver a linha por CONFIRMA_LINHA ms
+      motores(0, 0);
+      if (!linhaVisivel) { vistaDesde = 0; return; }
+      if (!vistaDesde) vistaDesde = agora;
+      if (agora - vistaDesde < CONFIRMA_LINHA) return;
+      ultimoErro = posicao - 3500;
+      mudarEtapa(SEGUINDO, agora);
+      logar("COR", "Linha encontrada: seguindo");
+      return;
+
+    case SEGUINDO:
+      if (pretos == 0) {
+        // linha sumiu: para e procura primeiro do lado onde ela foi vista por ultimo
+        motores(0, 0);
+        ladoBusca = posicao < 3500 ? -1 : 1;
+        mudarEtapa(PAUSA_1, agora);
+        logar("COR", String("Linha perdida: procurando pela ") + (ladoBusca < 0 ? "esquerda" : "direita"));
+        return;
+      }
+      if (!linhaVisivel) { motores(cfg.vb, cfg.vb); return; }   // faixa de chegada: atravessa reto
+      break;   // segue com o PD abaixo
+
+    case PAUSA_1:
+    case PAUSA_2:
+      motores(0, 0);
+      if (linhaVisivel) { mudarEtapa(SEGUINDO, agora); return; }
+      if (t >= PAUSA_BUSCA) mudarEtapa(etapa == PAUSA_1 ? BUSCA_1 : BUSCA_2, agora);
+      return;
+
+    case BUSCA_1:
+    case BUSCA_2:
+      if (linhaVisivel) {
+        motores(0, 0);
+        ultimoErro = posicao - 3500;
+        mudarEtapa(SEGUINDO, agora);
+        logar("COR", "Linha reencontrada: seguindo");
+        return;
+      }
+      if (etapa == BUSCA_1 && t >= BUSCA_LADO) {
+        // nao achou deste lado: para e vira para o outro
+        motores(0, 0);
+        mudarEtapa(PAUSA_2, agora);
+        return;
+      }
+      if (etapa == BUSCA_2 && t >= BUSCA_LADO * 2) {   // o dobro: volta o que girou e procura do outro lado
+        aguardar(agora, "Linha não encontrada dos dois lados: parado, aguardando linha");
+        return;
+      }
+      girar(etapa == BUSCA_1 ? ladoBusca : -ladoBusca);
+      return;
+  }
+
+  // controle PD: erro negativo = linha a esquerda = motor esquerdo mais devagar
+  int erro = posicao - 3500;
+  float correcao = cfg.kp * erro + cfg.kd * (erro - ultimoErro);
+  ultimoErro = erro;
+  motores(constrain(cfg.vb + (int)correcao, -255, 255),
+          constrain(cfg.vb - (int)correcao, -255, 255));
+}
+
+void aplicarManual(char d) {
+  int v = cfg.vm, giro = v * 7 / 10, curva = v * 4 / 10;
+  switch (d) {
+    case 'f': motores(v, v); break;
+    case 'b': motores(-v, -v); break;
+    case 'l': motores(-giro, giro); break;
+    case 'r': motores(giro, -giro); break;
+    case 'q': motores(curva, v); break;     // frente + esquerda
+    case 'e': motores(v, curva); break;     // frente + direita
+    case 'z': motores(-curva, -v); break;   // re + esquerda
+    case 'c': motores(-v, -curva); break;   // re + direita
+    default:  motores(0, 0);
+  }
+}
+
+// =====================================================================
+//  Bateria e tarefas de 1 em 1 segundo
+// =====================================================================
+void lerBateria() {
+  uint32_t mv = 0;
+  for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(PINO_BATERIA);
+  float v = mv / 8.0 / 1000.0 * DIVISOR_BAT;
+
+  bool agoraNaBateria = v >= BAT_PRESENTE;
+  if (agoraNaBateria != naBateria) {
+    naBateria = agoraNaBateria;
+    logar("BAT", naBateria ? "Rodando na bateria" : "Sem bateria: alimentado só pelo USB");
+    if (naBateria && !contouLigado) {
+      contouLigado = true;
+      vezesLigado++;
+      prefs.putULong("lig", vezesLigado);
+    }
+  }
+
+  if (v < 0.5) { bateriaV = -1; return; }   // divisor nao ligado ou bateria desligada
+  bateriaV = v;
+  bateriaPct = constrain((int)((v - BAT_VAZIA) * 100 / (BAT_CHEIA - BAT_VAZIA)), 0, 100);
+  if (!logouBateria) {
+    logouBateria = true;
+    logar("BAT", "Bateria em " + String(v, 2) + " V (" + bateriaPct + "%)");
+  }
+  if (bateriaPct < 15 && !avisouBateria) {
+    avisouBateria = true;
+    logar("BAT", "Bateria baixa: " + String(v, 2) + " V");
+  }
+}
+
+// Diagnostico pelo Monitor Serial: envie H, L ou F para o pino IR da barra
+void comandoSerial() {
+  if (!Serial.available()) return;
+  char c = toupper(Serial.read());
+  if (c == 'H') { pinMode(PINO_IR, OUTPUT); digitalWrite(PINO_IR, HIGH); }
+  else if (c == 'L') { pinMode(PINO_IR, OUTPUT); digitalWrite(PINO_IR, LOW); }
+  else if (c == 'F') { pinMode(PINO_IR, INPUT); }
+  else if (c == 'T') {
+    // descarrega cada saida e solta: se voltar sozinha para HIGH, a barra tem pull-up (tipo analogico)
+    Serial.print("[TIPO] apos descarregar: ");
+    for (int i = 0; i < 8; i++) {
+      pinMode(SENSORES[i], OUTPUT);
+      digitalWrite(SENSORES[i], LOW);
+      delayMicroseconds(20);
+      pinMode(SENSORES[i], INPUT);
+      delay(5);
+      Serial.print(digitalRead(SENSORES[i]));
+      Serial.print(' ');
+    }
+    Serial.println();
+    return;
+  }
+  else return;
+  Serial.printf("[IR] pino IR agora: %c\n", c);
+}
+
+void tarefasPorSegundo(unsigned long agora) {
+  static unsigned long ultima = 0, ultimoSalvo = 0;
+  if (agora - ultima < 1000) return;
+  ultima = agora;
+
+  lerBateria();
+
+  // leitura bruta dos sensores no Monitor Serial (para conferir a barra)
+  Serial.printf("[SEN] bruto D1..D8: %u %u %u %u %u %u %u %u | posicao %d\n",
+                bruto[0], bruto[1], bruto[2], bruto[3], bruto[4], bruto[5], bruto[6], bruto[7], posicao);
+  // tensao real de D1 e D2 (pinos 32 e 33 medem tensao mesmo com o Wi-Fi ligado)
+  Serial.printf("[ANA] D1 %d mV | D2 %d mV\n", analogReadMilliVolts(SENSORES[0]), analogReadMilliVolts(SENSORES[1]));
+
+  int n = WiFi.softAPgetStationNum();
+  if (n != clientes) {
+    logar("CON", n > clientes ? "Dispositivo conectado (" + String(n) + " no total)"
+                              : "Dispositivo desconectado (" + String(n) + " no total)");
+    clientes = n;
+    if (n == 0 && modo == MANUAL) setModo(PARADO);
+  }
+
+  if (agora - ultimoSalvo >= 60000) {
+    ultimoSalvo = agora;
+    prefs.putULong("tl", baseLigado + ligadoMs / 1000);
+    prefs.putULong("ta", baseAndando + andandoMs / 1000);
+  }
+}
+
+// =====================================================================
+//  Rotas do servidor web
+// =====================================================================
+void rotaStatus() {
+  unsigned long agora = millis();
+  char b[520];
+  snprintf(b, sizeof(b),
+    "{\"m\":%d,\"v\":%.2f,\"p\":%d,\"s\":[%d,%d,%d,%d,%d,%d,%d,%d],\"r\":[%u,%u,%u,%u,%u,%u,%u,%u],\"x\":%d,\"l\":%d,"
+    "\"va\":%lu,\"uv\":%lu,\"rec\":%lu,\"nv\":%lu,\"se\":%lu,\"bo\":%lu,\"tl\":%lu,\"ta\":%lu,\"tv\":%lu,\"cl\":%d,\"fb\":%d,\"sg\":%d}",
+    modo, bateriaV, bateriaPct,
+    valor[0], valor[1], valor[2], valor[3], valor[4], valor[5], valor[6], valor[7],
+    bruto[0], bruto[1], bruto[2], bruto[3], bruto[4], bruto[5], bruto[6], bruto[7],
+    posicao, linhaVisivel,
+    voltaInicio ? agora - voltaInicio : 0UL, ultimaVolta, recorde, voltasSessao,
+    sessao, vezesLigado, baseLigado + ligadoMs / 1000, baseAndando + andandoMs / 1000, totalVoltas, clientes,
+    naBateria, etapa);
+  server.send(200, "application/json", b);
+}
+
+void rotaComando() {
+  char d = server.arg("d").length() ? server.arg("d")[0] : 's';
+  if (modo == CALIBRANDO) { server.send(409, "text/plain", "calibrando"); return; }
+  if (d != 's' && modo != MANUAL) setModo(MANUAL);
+  if (modo == MANUAL) {
+    ultimoCmd = millis();
+    aplicarManual(d);
+  }
+  server.send(200, "text/plain", "ok");
+}
+
+// Teste de um motor por vez, sem depender da repeticao de comandos do Wi-Fi
+void rotaTesteMotor() {
+  if (modo != PARADO) setModo(PARADO);
+  int esq = constrain(server.arg("e").toInt(), -255, 255);
+  int dir = constrain(server.arg("d").toInt(), -255, 255);
+  motores(esq, dir);
+  testeAte = millis() + 2000;
+  logar("SIS", "Teste de motores: esquerdo " + String(esq) + ", direito " + String(dir));
+  server.send(200, "text/plain", "ok");
+}
+
+void rotaModo() {
+  int m = server.arg("v").toInt();
+  if (m >= PARADO && m <= CALIBRANDO) setModo((Modo)m);
+  server.send(200, "text/plain", "ok");
+}
+
+void rotaConfig() {
+  bool mudou = false;
+  if (server.hasArg("vb")) { cfg.vb = constrain(server.arg("vb").toInt(), 0, 255); mudou = true; }
+  if (server.hasArg("kp")) { cfg.kp = server.arg("kp").toFloat(); mudou = true; }
+  if (server.hasArg("kd")) { cfg.kd = server.arg("kd").toFloat(); mudou = true; }
+  if (server.hasArg("vm")) { cfg.vm = constrain(server.arg("vm").toInt(), 0, 255); mudou = true; }
+  if (mudou) salvarCfgEm = millis() + 1500;   // espera parar de mexer para gravar na flash
+  char b[120];
+  snprintf(b, sizeof(b), "{\"vb\":%d,\"kp\":%.3f,\"kd\":%.2f,\"vm\":%d}", cfg.vb, cfg.kp, cfg.kd, cfg.vm);
+  server.send(200, "application/json", b);
+}
+
+void rotaLogs() {
+  File arquivos[2];
+  size_t total = 0;
+  const char* nomes[2] = {LOG_ANTIGO, LOG_ATUAL};
+  for (int i = 0; i < 2; i++) {
+    if (LittleFS.exists(nomes[i])) {
+      arquivos[i] = LittleFS.open(nomes[i], "r");
+      total += arquivos[i].size();
+    }
+  }
+  server.setContentLength(total);
+  server.send(200, "text/plain; charset=utf-8", "");
+  uint8_t buf[512];
+  for (int i = 0; i < 2; i++) {
+    if (!arquivos[i]) continue;
+    while (arquivos[i].available()) {
+      size_t n = arquivos[i].read(buf, sizeof(buf));
+      server.sendContent((const char*)buf, n);
+    }
+    arquivos[i].close();
+  }
+}
+
+void rotaApagarLogs() {
+  LittleFS.remove(LOG_ANTIGO);
+  LittleFS.remove(LOG_ATUAL);
+  logar("SIS", "Logs apagados pelo painel");
+  server.send(200, "text/plain", "ok");
+}
+
+void rotaHora() {
+  static bool sincronizado = false;
+  if (!sincronizado && server.hasArg("e")) {
+    sincronizado = true;
+    logar("SIS", "Relógio sincronizado @" + server.arg("e"));
+  }
+  server.send(200, "text/plain", "ok");
+}
+
+void rotaZerarRecorde() {
+  recorde = 0;
+  prefs.putULong("rec", 0);
+  logar("COR", "Recorde zerado");
+  server.send(200, "text/plain", "ok");
+}
+
+void rotaZerarOdometro() {
+  vezesLigado = naBateria ? 1 : 0;      // se ja esta na bateria, esta vez conta
+  baseLigado = baseAndando = ligadoMs = andandoMs = totalVoltas = 0;
+  prefs.putULong("lig", vezesLigado);
+  prefs.putULong("tl", 0);
+  prefs.putULong("ta", 0);
+  prefs.putULong("tv", 0);
+  logar("SIS", "Odômetro zerado");
+  server.send(200, "text/plain", "ok");
+}
+
+// =====================================================================
+//  Setup e loop
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(PINO_LED, OUTPUT);
+  pinMode(PINO_IR, OUTPUT);
+  digitalWrite(PINO_IR, HIGH);   // LEDs infravermelhos da barra sempre acesos
+  for (int p : {IN1, IN2, IN3, IN4}) pinMode(p, OUTPUT);
+  ledcAttach(ENA, 1000, 8);
+  ledcAttach(ENB, 1000, 8);
+  motores(0, 0);
+  analogSetPinAttenuation(PINO_BATERIA, ADC_11db);
+
+  LittleFS.begin(true);   // formata na primeira vez
+  prefs.begin("carro", false);
+
+  sessao = prefs.getULong("boots", 0) + 1;
+  prefs.putULong("boots", sessao);
+  baseLigado = prefs.getULong("tl", 0);
+  baseAndando = prefs.getULong("ta", 0);
+  totalVoltas = prefs.getULong("tv", 0);
+  vezesLigado = prefs.getULong("lig", 0);
+  recorde = prefs.getULong("rec", 0);
+  cfg.vb = prefs.getInt("vb", cfg.vb);
+  cfg.kp = prefs.getFloat("kp", cfg.kp);
+  cfg.kd = prefs.getFloat("kd", cfg.kd);
+  cfg.vm = prefs.getInt("vm", cfg.vm);
+  carregarCalibracao();
+
+  logar("SIS", "Boot #" + String(sessao) + ": " + motivoReset());
+
+  WiFi.mode(WIFI_AP);
+  if (WiFi.softAP(WIFI_NOME, WIFI_SENHA))
+    logar("CON", "Rede " + String(WIFI_NOME) + " criada em " + WiFi.softAPIP().toString());
+  else
+    logar("CON", "Falha ao criar a rede Wi-Fi");
+
+  server.on("/", []() { server.send_P(200, "text/html", PAGINA); });
+  server.on("/s", rotaStatus);
+  server.on("/c", rotaComando);
+  server.on("/m", rotaModo);
+  server.on("/p", rotaConfig);
+  server.on("/l", rotaLogs);
+  server.on("/lc", rotaApagarLogs);
+  server.on("/t", rotaHora);
+  server.on("/rr", rotaZerarRecorde);
+  server.on("/zo", rotaZerarOdometro);
+  server.on("/mt", rotaTesteMotor);
+  server.onNotFound([]() { server.send(404, "text/plain", "nao encontrado"); });
+  server.begin();
+}
+
+void loop() {
+  // atende o painel ANTES de ler o relogio: os comandos gravam millis() e "agora"
+  // nunca pode ser menor que eles (a conta sem sinal viraria um numero gigante)
+  server.handleClient();
+
+  static unsigned long anterior = millis();
+  unsigned long agora = millis();
+  if (naBateria) {
+    ligadoMs += agora - anterior;
+    if (andando) andandoMs += agora - anterior;
+  }
+  anterior = agora;
+
+  lerSensores();
+
+  switch (modo) {
+    case AUTO:       seguirLinha(agora); break;
+    case CALIBRANDO: calibrar(agora); break;
+    case MANUAL:
+      if (agora - ultimoCmd > PARADA_SEGURANCA && andando) {
+        Serial.printf("[MAN] parada de seguranca: %lu ms sem comando\n", agora - ultimoCmd);
+        motores(0, 0);
+      }
+      break;
+    default:
+      if (testeAte && agora > testeAte) {
+        testeAte = 0;
+        motores(0, 0);
+      }
+      break;
+  }
+
+  if (salvarCfgEm && agora > salvarCfgEm) {
+    salvarCfgEm = 0;
+    prefs.putInt("vb", cfg.vb);
+    prefs.putFloat("kp", cfg.kp);
+    prefs.putFloat("kd", cfg.kd);
+    prefs.putInt("vm", cfg.vm);
+    logar("PID", "Ajuste salvo: vel " + String(cfg.vb) + ", Kp " + String(cfg.kp, 3) +
+                 ", Kd " + String(cfg.kd, 2) + ", manual " + String(cfg.vm));
+  }
+
+  tarefasPorSegundo(agora);
+  comandoSerial();
+
+  // LED: aceso andando sozinho, piscando parado
+  digitalWrite(PINO_LED, modo == AUTO || modo == MANUAL || (modo == PARADO && (agora / 500) % 2));
+}
