@@ -9,8 +9,8 @@ Projeto do TDE de Conectividade de Sistemas Ciberfísicos, Engenharia de Softwar
 
 ## O que ele faz
 
-- **Segue a linha sozinho.** Lê uma fita preta no chão com uma barra de 8 sensores infravermelhos.
-- **Procura a linha com calma.** Se perde a linha, para, gira para o lado onde a viu por último e depois para o outro. Se não encontrar, para e espera.
+- **Segue a linha sozinho.** Lê uma fita preta no chão com uma barra de 8 sensores infravermelhos, calibrados um a um. O objetivo é manter a linha nos sensores do meio: quanto mais ela vai para uma ponta, mais forte ele vira para o lado contrário.
+- **Reencontra a linha.** Se perde a linha, dá ré até a barra passar por ela, gira no lugar até centralizá-la e volta a seguir reto. Se não encontrar, para e espera.
 - **Controle remoto.** Pode ser dirigido pelo celular ou pelo teclado do PC (W, A, S, D). Se os comandos param de chegar por 1 s, ele para sozinho.
 - **Painel web próprio.** O ESP32 cria a rede Wi-Fi `ESP32` e o painel abre em `http://192.168.4.1`, sem precisar de internet.
 - **Histórico na memória flash.** Os eventos ficam gravados por sessão (LittleFS), com filtros e download em .txt.

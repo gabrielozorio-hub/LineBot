@@ -36,6 +36,7 @@ button.on,.stop{background:#111;color:#fff}
 .pad button.on{background:#111;color:#fff}
 label{display:flex;justify-content:space-between;margin:14px 0 4px;font-size:14px}
 input[type=range]{width:100%;accent-color:#111}
+select{width:100%;padding:8px;border:1px solid #ddd;border-radius:8px;background:#fff;font:inherit}
 details{border-top:1px solid #ddd;padding:10px 0}
 summary{cursor:pointer;font-weight:600;font-size:14px}
 .log{font-family:ui-monospace,Menlo,monospace;font-size:12px;display:grid;grid-template-columns:auto auto 1fr;gap:3px 12px;margin-top:8px}
@@ -55,7 +56,7 @@ summary{cursor:pointer;font-weight:600;font-size:14px}
   <button onclick="modo(2)">Manual</button><button onclick="modo(3)">Calibrar</button></div></div>
  <div class="card"><h2>Sensores ao vivo</h2><div id="sens"></div><div id="pos"><i></i></div><small id="lin">-</small>
   <div id="raw" class="mut" style="display:grid;grid-template-columns:repeat(8,1fr);gap:4px;text-align:center;font-size:11px;margin-top:6px"></div>
-  <small>Leitura bruta em µs: branco = número baixo, preto = número alto (até 2500).</small></div>
+  <small>Leitura bruta em µs: branco = número baixo, preto = número alto (até 3000). Depois de mudar a altura da barra, rode Calibrar passando os sensores sobre a linha e o chão.</small></div>
  <div class="grid" style="margin-bottom:12px">
   <div class="card"><h2>Bateria</h2><div class="big" id="bp">--</div><small id="bv">-</small><div class="bar"><i id="bb" style="width:0"></i></div></div>
   <div class="card"><h2>Volta atual</h2><div class="big" id="va">--</div><small id="uv">-</small></div>
@@ -81,11 +82,20 @@ summary{cursor:pointer;font-weight:600;font-size:14px}
 </section>
 
 <section id="ajustes" class="hide">
- <div class="card"><h2>Controle PID (modo automático)</h2>
-  <label>Velocidade base <b id="vbv"></b></label><input type="range" id="vb" min="0" max="255" step="5">
-  <label>Kp (proporcional) <b id="kpv"></b></label><input type="range" id="kp" min="0" max="0.3" step="0.005">
-  <label>Kd (derivativo) <b id="kdv"></b></label><input type="range" id="kd" min="0" max="3" step="0.05">
+ <div class="card"><h2>Direção (modo automático)</h2>
+  <label>Velocidade <b id="vbv"></b></label><input type="range" id="vb" min="60" max="255" step="5">
+  <label>Força da curva (%) <b id="cvv"></b></label><input type="range" id="cv" min="0" max="100" step="5">
+  <small style="display:block;margin-top:4px">Quanto ele luta para trazer a linha de volta aos sensores do meio. Indo para a ponta, a roda de fora acelera e a de dentro freia; em 100 a de dentro gira para trás com tudo. Se ele zigue-zagueia, diminua. Se a linha escapa pela ponta, aumente.</small>
+  <label>Folga no centro <b id="rtv"></b></label><input type="range" id="rt" min="0" max="1500" step="50">
+  <small style="display:block;margin-top:4px">Faixa no meio da barra em que os dois motores ficam iguais. 0 = corrige sempre. 1000 = um sensor para cada lado.</small>
+  <label>Lado da direção <b id="invv"></b></label><select id="inv"><option value="0">Normal</option><option value="1">Invertido</option></select>
+  <small style="display:block;margin-top:4px">Normal: linha nos sensores da direita, ele vira para a esquerda (e vice-versa). Se fizer o contrário, troque para Invertido.</small>
   <p class="mut" style="margin-top:12px">Vale na hora e fica salvo na memória flash.</p></div>
+ <div class="card"><h2>Motores</h2>
+  <label>Balanço (%) <b id="balv"></b></label><input type="range" id="bal" min="-50" max="50" step="1">
+  <small style="display:block;margin-top:4px">Se no manual, segurando W, ele puxa para a esquerda, o motor direito é mais forte: aumente (tira força do direito). Puxando para a direita, diminua (tira do esquerdo).</small>
+  <label>Força mínima <b id="pmv"></b></label><input type="range" id="pm" min="0" max="200" step="5">
+  <small style="display:block;margin-top:4px">Menor força que faz a roda girar. Se numa curva uma roda fica parada só chiando, aumente.</small></div>
  <div class="card"><h2>Teste de motores</h2>
   <p class="mut" style="margin-bottom:10px">Com o carrinho suspenso. Cada botão gira por 2 s na força máxima.</p>
   <div class="row"><button onclick="testar(255,0)">Esquerdo ↑</button><button onclick="testar(-255,0)">Esquerdo ↓</button>
@@ -96,7 +106,7 @@ summary{cursor:pointer;font-weight:600;font-size:14px}
 
 <section id="logs" class="hide">
  <div class="card">
-  <div class="row" id="filtros"><button data-c="" class="on">Tudo</button><button data-c="SIS">Sistema</button><button data-c="COR">Corrida</button><button data-c="PID">PID</button><button data-c="BAT">Bateria</button><button data-c="CON">Conexão</button></div>
+  <div class="row" id="filtros"><button data-c="" class="on">Tudo</button><button data-c="SIS">Sistema</button><button data-c="COR">Corrida</button><button data-c="PID">Ajustes</button><button data-c="BAT">Bateria</button><button data-c="CON">Conexão</button></div>
   <div class="row" style="margin-top:10px"><button onclick="carregarLogs()">Atualizar</button><button onclick="baixar()">Baixar .txt</button><button onclick="apagar()">Apagar</button></div>
   <div id="ls" style="margin-top:10px"></div></div>
 </section>
@@ -106,8 +116,8 @@ summary{cursor:pointer;font-weight:600;font-size:14px}
 <script>
 const $=id=>document.getElementById(id);
 const MOD=['Parado','Automático','Manual','Calibrando'];
-const ETAPA=['aguardando linha','seguindo a linha','linha perdida','procurando de um lado','linha perdida','procurando do outro lado'];
-const CAT={SIS:'Sistema',COR:'Corrida',PID:'PID',BAT:'Bateria',CON:'Conexão'};
+const ETAPA=['aguardando linha','seguindo a linha','dando ré','centralizando'];
+const CAT={SIS:'Sistema',COR:'Corrida',PID:'Ajustes',BAT:'Bateria',CON:'Conexão'};
 let aba='painel',S={};
 
 function toast(t){const e=$('toast');e.textContent=t;e.style.opacity=1;clearTimeout(e.t);e.t=setTimeout(()=>e.style.opacity=0,1500)}
@@ -199,10 +209,10 @@ let pref;try{pref=localStorage.disp}catch(e){}
 disp(pref||(matchMedia('(pointer:coarse)').matches?'cel':'pc'));
 
 // ajustes salvos na flash
-const CFG=['vb','kp','kd','vm'];
-const mostra=n=>$(n+'v').textContent=$(n).value;
+const CFG=['vb','rt','cv','bal','pm','vm','inv'];
+const mostra=n=>$(n+'v').textContent=n=='inv'?'':$(n).value;
 let tcfg;
-CFG.forEach(n=>$(n).oninput=()=>{
+CFG.forEach(n=>$(n).oninput=$(n).onchange=()=>{
  mostra(n);clearTimeout(tcfg);
  tcfg=setTimeout(()=>get('/p?'+CFG.map(x=>x+'='+$(x).value).join('&')).then(()=>toast('Salvo na flash')),300);
 });

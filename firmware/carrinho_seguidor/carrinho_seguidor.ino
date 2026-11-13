@@ -27,14 +27,18 @@ const bool LINHA_PRETA = true;         // linha preta no chao branco
 const float DIVISOR_BAT = 4.0;         // 4 resistores iguais de 100k: 3 do lado da bateria, 1 do lado do GND
 const float BAT_VAZIA = 4.4;           // 4 pilhas AA: 4,4 V vazia
 const float BAT_CHEIA = 6.4;           //              6,4 V cheia
-const uint16_t TIMEOUT_RC = 2500;      // us - tempo maximo de leitura de cada sensor
+const uint16_t TIMEOUT_RC = 3000;      // us - tempo maximo de leitura (mais alto = mais folga com a barra longe do chao)
+// sem calibracao usa a faixa fixa abaixo; depois de calibrar cada sensor usa o proprio branco e preto
 const int BRANCO_MAX = 600;            // leitura ate aqui = branco (o branco oscila entre 0 e ~600)
-const int LIMIAR_PRETO = 1500;         // leitura acima disso = sensor no preto (o preto da 2500)
+const int LIMIAR_PRETO = 1500;         // leitura acima disso = sensor no preto
+const int CALIB_MIN_FAIXA = 300;       // diferenca minima entre branco e preto para confiar na calibracao
 const unsigned long PARADA_SEGURANCA = 1000;  // ms sem comando no manual = para (o Wi-Fi as vezes atrasa)
 const unsigned long CONFIRMA_LINHA = 100;     // ms vendo a linha antes de comecar a andar (evita falso disparo)
-const int VEL_BUSCA = 120;                    // forca para girar procurando a linha (baixo demais = motor nao gira)
-const unsigned long BUSCA_LADO = 700;         // ms girando para o primeiro lado (o segundo lado usa o dobro)
-const unsigned long PAUSA_BUSCA = 150;        // ms parado entre um movimento e outro, para ir com calma
+const int VEL_RE = 160;                       // forca da re quando perde a linha
+const unsigned long RE_MAX = 2500;            // ms de re sem achar a linha antes de desistir e parar
+const int VEL_CENTRO = 150;                   // forca para girar no lugar ate a linha ficar no meio
+const int CENTRO_OK = 500;                    // linha a ate meio sensor do centro = centralizada
+const unsigned long CENTRALIZA_MAX = 2000;    // ms tentando centralizar antes de desistir e parar
 const unsigned long TODOS_PRETO_MAX = 500;    // ms com os 8 no preto = carrinho levantado ou fora da pista
 
 // ---------------- Estado ----------------
@@ -45,26 +49,32 @@ Modo modo = PARADO;
 WebServer server(80);
 Preferences prefs;
 
-struct Config { int vb; float kp; float kd; int vm; } cfg = {130, 0.05, 0.5, 180};
+// vb  = velocidade no modo automatico
+// rt  = folga no centro: distancia do centro (1000 = um sensor) em que os dois motores ficam iguais
+// cv  = forca da curva em % (100 = nas pontas a roda de fora vai a 255 e a de dentro a -255)
+// bal = balanco dos motores em % (positivo = tira forca do direito, negativo = do esquerdo)
+// pm  = forca minima que faz o motor sair do lugar (zona morta)
+// vm  = velocidade no modo manual
+// inv = inverte o lado da direcao (barra de sensores montada ao contrario)
+struct Config { int vb; int rt; int cv; int bal; int pm; int vm; int inv; } cfg = {150, 250, 80, 0, 90, 180, 0};
 unsigned long salvarCfgEm = 0;
 
 uint16_t bruto[8], minimo[8], maximo[8];
+bool calibrado = false;      // ja existe calibracao salva na flash
 int filtrado[8];             // leitura bruta suavizada (media movel)
 int valor[8];                // 0 = chao, 1000 = linha
 int posicao = 3500;          // 0 (D1) ... 7000 (D8)
 bool linhaVisivel = false;
 int pretos = 0;              // quantos sensores veem preto (faixa de chegada = quase todos)
-int ultimoErro = 0;
 bool andando = false;
 
 unsigned long ultimoCmd = 0, calibInicio = 0, vistaDesde = 0, todosDesde = 0;
 unsigned long testeAte = 0;    // teste de motores pelo painel (para sozinho depois de 2 s)
 
 // etapas do modo automatico
-enum Etapa { AGUARDANDO, SEGUINDO, PAUSA_1, BUSCA_1, PAUSA_2, BUSCA_2 };
+enum Etapa { AGUARDANDO, SEGUINDO, DANDO_RE, CENTRALIZANDO };
 Etapa etapa = AGUARDANDO;
 unsigned long etapaDesde = 0;
-int ladoBusca = 1;             // -1 = procura primeiro na esquerda, 1 = na direita
 
 // voltas
 unsigned long voltaInicio = 0, ultimaVolta = 0, recorde = 0, marcaDesde = 0, ultimaMarca = 0;
@@ -129,18 +139,29 @@ const char* motivoReset() {
 // =====================================================================
 //  Motores
 // =====================================================================
+// zona morta: abaixo de cfg.pm o motor so chia e nao gira. Espalha 1..255 entre pm..255
+// para que qualquer forca pedida (inclusive a roda de dentro numa curva) realmente gire
+int comZonaMorta(int vel) {
+  if (vel == 0) return 0;
+  int forca = cfg.pm + (long)min(abs(vel), 255) * (255 - cfg.pm) / 255;
+  return vel > 0 ? forca : -forca;
+}
+
 void motor(int en, int a, int b, int vel, bool inverte) {
   if (inverte) vel = -vel;
-  vel = constrain(vel, -255, 255);
+  vel = comZonaMorta(constrain(vel, -255, 255));
   digitalWrite(a, vel > 0);
   digitalWrite(b, vel < 0);
   ledcWrite(en, abs(vel));
 }
 
 void motores(int esq, int dir) {
+  andando = esq != 0 || dir != 0;
+  // balanco: um motor mais forte que o outro faz o carrinho andar torto
+  if (cfg.bal > 0) dir = (long)dir * (100 - cfg.bal) / 100;
+  if (cfg.bal < 0) esq = (long)esq * (100 + cfg.bal) / 100;
   motor(ENB, IN3, IN4, esq, INVERTE_ESQ);
   motor(ENA, IN1, IN2, dir, INVERTE_DIR);
-  andando = esq != 0 || dir != 0;
 }
 
 // =====================================================================
@@ -172,16 +193,27 @@ void lerSensores() {
   for (int i = 0; i < 8; i++) {
     // media movel: suaviza a oscilacao do branco (cada leitura nova vale 1/3)
     filtrado[i] = (filtrado[i] * 2 + bruto[i]) / 3;
-    int leitura = LINHA_PRETA ? filtrado[i] : TIMEOUT_RC - filtrado[i];
-    // faixa fixa: ate BRANCO_MAX = 0 (chao), TIMEOUT_RC = 1000 (linha)
-    int v = constrain((long)(leitura - BRANCO_MAX) * 1000 / (TIMEOUT_RC - BRANCO_MAX), 0, 1000);
+    int v;
+    bool preto;
+    if (calibrado && maximo[i] - minimo[i] >= CALIB_MIN_FAIXA) {
+      // calibrado: o branco e o preto medidos deste sensor viram 0 e 1000, preto = passou da metade
+      v = constrain((long)(filtrado[i] - minimo[i]) * 1000 / (maximo[i] - minimo[i]), 0, 1000);
+      if (!LINHA_PRETA) v = 1000 - v;
+      preto = v >= 500;
+    } else {
+      // faixa fixa: ate BRANCO_MAX = 0 (chao), TIMEOUT_RC = 1000 (linha)
+      int leitura = LINHA_PRETA ? filtrado[i] : TIMEOUT_RC - filtrado[i];
+      v = constrain((long)(leitura - BRANCO_MAX) * 1000 / (TIMEOUT_RC - BRANCO_MAX), 0, 1000);
+      preto = leitura > LIMIAR_PRETO;
+    }
     valor[i] = v;
-    if (v > 0) { soma += (long)v * i * 1000; peso += v; }
-    if (leitura > LIMIAR_PRETO) pretos++;
+    int p = v - 150;             // ignora o ruido do branco no calculo da posicao
+    if (p > 0) { soma += (long)p * i * 1000; peso += p; }
+    if (preto) pretos++;
   }
   // linha = de 1 a 5 sensores no preto. Os 8 no preto = faixa de chegada, carrinho levantado
   // ou fora da pista (sem nada embaixo o sensor tambem le 2500)
-  linhaVisivel = pretos >= 1 && pretos <= 5;
+  linhaVisivel = pretos >= 1 && pretos <= 5 && peso > 0;
   if (linhaVisivel) posicao = soma / peso;    // senao guarda a ultima posicao (lado onde viu a linha)
 }
 
@@ -190,6 +222,7 @@ void carregarCalibracao() {
   if (prefs.getBytesLength("cmin") == sizeof(minimo)) {
     prefs.getBytes("cmin", minimo, sizeof(minimo));
     prefs.getBytes("cmax", maximo, sizeof(maximo));
+    calibrado = true;
   }
 }
 
@@ -205,7 +238,6 @@ void setModo(Modo m) {
   vistaDesde = 0;
   todosDesde = 0;
   etapa = AGUARDANDO;
-  ultimoErro = 0;
   if (m == CALIBRANDO) {
     calibInicio = millis();
     for (int i = 0; i < 8; i++) { minimo[i] = TIMEOUT_RC; maximo[i] = 0; }
@@ -229,10 +261,14 @@ void calibrar(unsigned long agora) {
   motores(0, 0);
   prefs.putBytes("cmin", minimo, sizeof(minimo));
   prefs.putBytes("cmax", maximo, sizeof(maximo));
-  String ruins = "";
-  for (int i = 0; i < 8; i++)
-    if (maximo[i] - minimo[i] < 300) ruins += " D" + String(i + 1);
-  if (ruins.length()) logar("SIS", "Calibração fraca nos sensores" + ruins);
+  calibrado = true;
+  String ruins = "", faixas = "";
+  for (int i = 0; i < 8; i++) {
+    if (maximo[i] - minimo[i] < CALIB_MIN_FAIXA) ruins += " D" + String(i + 1);
+    faixas += " " + String(minimo[i]) + "-" + String(maximo[i]);
+  }
+  logar("SIS", "Calibração (branco-preto em µs):" + faixas);
+  if (ruins.length()) logar("SIS", "Calibração fraca (passe a linha embaixo deles ou baixe a barra):" + ruins);
   else logar("SIS", "Calibração concluída");
   setModo(PARADO);
 }
@@ -271,9 +307,12 @@ void aguardar(unsigned long agora, const String& motivo) {
   logar("COR", motivo);
 }
 
-// gira no lugar: lado 1 = direita, -1 = esquerda
-void girar(int lado) {
-  motores(lado * VEL_BUSCA, -lado * VEL_BUSCA);
+// quanto e para onde virar para trazer a linha ao centro (-3500..3500):
+// negativo = virar para a esquerda (linha nos sensores da direita, D5..D8), positivo = para a direita.
+// Sempre o lado contrario de onde a barra viu a linha; cfg.inv troca, se a barra for montada ao contrario
+int erroLinha() {
+  int e = 3500 - posicao;
+  return cfg.inv ? -e : e;
 }
 
 void seguirLinha(unsigned long agora) {
@@ -307,59 +346,69 @@ void seguirLinha(unsigned long agora) {
       if (!linhaVisivel) { vistaDesde = 0; return; }
       if (!vistaDesde) vistaDesde = agora;
       if (agora - vistaDesde < CONFIRMA_LINHA) return;
-      ultimoErro = posicao - 3500;
       mudarEtapa(SEGUINDO, agora);
       logar("COR", "Linha encontrada: seguindo");
       return;
 
     case SEGUINDO:
       if (pretos == 0) {
-        // linha sumiu: para e procura primeiro do lado onde ela foi vista por ultimo
-        motores(0, 0);
-        ladoBusca = posicao < 3500 ? -1 : 1;
-        mudarEtapa(PAUSA_1, agora);
-        logar("COR", String("Linha perdida: procurando pela ") + (ladoBusca < 0 ? "esquerda" : "direita"));
+        // linha sumiu: volta de re pelo caminho que veio ate a barra passar por ela de novo
+        motores(-VEL_RE, -VEL_RE);
+        mudarEtapa(DANDO_RE, agora);
+        logar("COR", "Linha perdida: dando ré até encontrar");
         return;
       }
       if (!linhaVisivel) { motores(cfg.vb, cfg.vb); return; }   // faixa de chegada: atravessa reto
-      break;   // segue com o PD abaixo
+      break;   // segue com a direcao por zonas abaixo
 
-    case PAUSA_1:
-    case PAUSA_2:
-      motores(0, 0);
-      if (linhaVisivel) { mudarEtapa(SEGUINDO, agora); return; }
-      if (t >= PAUSA_BUSCA) mudarEtapa(etapa == PAUSA_1 ? BUSCA_1 : BUSCA_2, agora);
-      return;
-
-    case BUSCA_1:
-    case BUSCA_2:
+    case DANDO_RE:
       if (linhaVisivel) {
-        motores(0, 0);
-        ultimoErro = posicao - 3500;
-        mudarEtapa(SEGUINDO, agora);
-        logar("COR", "Linha reencontrada: seguindo");
+        mudarEtapa(CENTRALIZANDO, agora);
+        logar("COR", "Linha reencontrada na ré: centralizando");
         return;
       }
-      if (etapa == BUSCA_1 && t >= BUSCA_LADO) {
-        // nao achou deste lado: para e vira para o outro
-        motores(0, 0);
-        mudarEtapa(PAUSA_2, agora);
+      if (t >= RE_MAX) {
+        aguardar(agora, "Linha não encontrada na ré: parado, aguardando linha");
         return;
       }
-      if (etapa == BUSCA_2 && t >= BUSCA_LADO * 2) {   // o dobro: volta o que girou e procura do outro lado
-        aguardar(agora, "Linha não encontrada dos dois lados: parado, aguardando linha");
-        return;
-      }
-      girar(etapa == BUSCA_1 ? ladoBusca : -ladoBusca);
+      motores(-VEL_RE, -VEL_RE);
       return;
+
+    case CENTRALIZANDO: {
+      // parado no lugar, gira ate a linha ficar nos sensores do meio e so entao segue reto
+      if (pretos == 0) { motores(-VEL_RE, -VEL_RE); mudarEtapa(DANDO_RE, agora); return; }
+      int erro = erroLinha();
+      if (linhaVisivel && abs(erro) <= CENTRO_OK) {
+        mudarEtapa(SEGUINDO, agora);
+        logar("COR", "Linha no centro: seguindo");
+        return;
+      }
+      if (t >= CENTRALIZA_MAX) {
+        aguardar(agora, "Não conseguiu centralizar a linha: parado, aguardando linha");
+        return;
+      }
+      int lado = erro < 0 ? -1 : 1;
+      motores(lado * VEL_CENTRO, -lado * VEL_CENTRO);
+      return;
+    }
   }
 
-  // controle PD: erro negativo = linha a esquerda = motor esquerdo mais devagar
-  int erro = posicao - 3500;
-  float correcao = cfg.kp * erro + cfg.kd * (erro - ultimoErro);
-  ultimoErro = erro;
-  motores(constrain(cfg.vb + (int)correcao, -255, 255),
-          constrain(cfg.vb - (int)correcao, -255, 255));
+  // objetivo: manter a linha nos sensores do meio. So com ela bem no centro os dois motores
+  // ficam iguais; quanto mais ela vai para a ponta, mais a roda de fora acelera (ate 255) e a de
+  // dentro freia, chegando a girar para tras nas pontas para virar com forca.
+  // erro negativo = vira para a esquerda (linha nos sensores da direita)
+  int erro = erroLinha();
+  int dist = abs(erro);
+  int esq = cfg.vb, dir = cfg.vb;
+  if (dist > cfg.rt) {
+    long f = (long)(dist - cfg.rt) * 1000 / (3500 - cfg.rt);   // 0 na borda do centro, 1000 na ponta
+    long g = min(f, 1000L) * cfg.cv / 100;                     // forca da curva aplicada (0..1000)
+    int externa = cfg.vb + (long)(255 - cfg.vb) * min(g * 2, 1000L) / 1000;   // acelera ja na metade
+    int interna = cfg.vb - (long)(cfg.vb + 255) * g / 1000;                   // freia e inverte
+    if (erro < 0) { esq = interna; dir = externa; }
+    else          { esq = externa; dir = interna; }
+  }
+  motores(esq, dir);
 }
 
 void aplicarManual(char d) {
@@ -513,12 +562,16 @@ void rotaModo() {
 void rotaConfig() {
   bool mudou = false;
   if (server.hasArg("vb")) { cfg.vb = constrain(server.arg("vb").toInt(), 0, 255); mudou = true; }
-  if (server.hasArg("kp")) { cfg.kp = server.arg("kp").toFloat(); mudou = true; }
-  if (server.hasArg("kd")) { cfg.kd = server.arg("kd").toFloat(); mudou = true; }
+  if (server.hasArg("rt")) { cfg.rt = constrain(server.arg("rt").toInt(), 0, 3000); mudou = true; }
+  if (server.hasArg("cv")) { cfg.cv = constrain(server.arg("cv").toInt(), 0, 100); mudou = true; }
+  if (server.hasArg("inv")) { cfg.inv = server.arg("inv").toInt() ? 1 : 0; mudou = true; }
+  if (server.hasArg("bal")) { cfg.bal = constrain(server.arg("bal").toInt(), -50, 50); mudou = true; }
+  if (server.hasArg("pm")) { cfg.pm = constrain(server.arg("pm").toInt(), 0, 200); mudou = true; }
   if (server.hasArg("vm")) { cfg.vm = constrain(server.arg("vm").toInt(), 0, 255); mudou = true; }
   if (mudou) salvarCfgEm = millis() + 1500;   // espera parar de mexer para gravar na flash
   char b[120];
-  snprintf(b, sizeof(b), "{\"vb\":%d,\"kp\":%.3f,\"kd\":%.2f,\"vm\":%d}", cfg.vb, cfg.kp, cfg.kd, cfg.vm);
+  snprintf(b, sizeof(b), "{\"vb\":%d,\"rt\":%d,\"cv\":%d,\"bal\":%d,\"pm\":%d,\"vm\":%d,\"inv\":%d}",
+           cfg.vb, cfg.rt, cfg.cv, cfg.bal, cfg.pm, cfg.vm, cfg.inv);
   server.send(200, "application/json", b);
 }
 
@@ -604,8 +657,11 @@ void setup() {
   vezesLigado = prefs.getULong("lig", 0);
   recorde = prefs.getULong("rec", 0);
   cfg.vb = prefs.getInt("vb", cfg.vb);
-  cfg.kp = prefs.getFloat("kp", cfg.kp);
-  cfg.kd = prefs.getFloat("kd", cfg.kd);
+  cfg.rt = prefs.getInt("rt2", cfg.rt);
+  cfg.cv = prefs.getInt("cv2", cfg.cv);
+  cfg.inv = prefs.getInt("inv2", cfg.inv);
+  cfg.bal = prefs.getInt("bal", cfg.bal);
+  cfg.pm = prefs.getInt("pm", cfg.pm);
   cfg.vm = prefs.getInt("vm", cfg.vm);
   carregarCalibracao();
 
@@ -667,11 +723,16 @@ void loop() {
   if (salvarCfgEm && agora > salvarCfgEm) {
     salvarCfgEm = 0;
     prefs.putInt("vb", cfg.vb);
-    prefs.putFloat("kp", cfg.kp);
-    prefs.putFloat("kd", cfg.kd);
+    prefs.putInt("rt2", cfg.rt);
+    prefs.putInt("cv2", cfg.cv);
+    prefs.putInt("inv2", cfg.inv);
+    prefs.putInt("bal", cfg.bal);
+    prefs.putInt("pm", cfg.pm);
     prefs.putInt("vm", cfg.vm);
-    logar("PID", "Ajuste salvo: vel " + String(cfg.vb) + ", Kp " + String(cfg.kp, 3) +
-                 ", Kd " + String(cfg.kd, 2) + ", manual " + String(cfg.vm));
+    logar("PID", "Ajuste salvo: vel " + String(cfg.vb) + ", folga centro " + String(cfg.rt) +
+                 ", curva " + String(cfg.cv) + "%, balanço " + String(cfg.bal) +
+                 "%, força mín " + String(cfg.pm) + ", manual " + String(cfg.vm) +
+                 (cfg.inv ? ", direção invertida" : ""));
   }
 
   tarefasPorSegundo(agora);
